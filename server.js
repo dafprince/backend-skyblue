@@ -128,6 +128,20 @@ app.post('/api/create-checkout-session', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({ message: 'Backend SkyBlue opérationnel ✅' });
 });
+// Route de santé pour UptimeRobot
+app.get('/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'healthy',
+    uptime: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString(),
+    service: 'SkyBlue Backend'
+  });
+});
+
+// Route de test (garde aussi celle-ci)
+app.get('/', (req, res) => {
+  res.json({ message: 'Backend SkyBlue opérationnel ✅' });
+});
 
 // Démarrer le serveur
 app.listen(PORT, () => {
