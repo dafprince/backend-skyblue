@@ -1,12 +1,15 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { createClient } = require('@supabase/supabase-js');
-//const emailjs = require('@emailjs/nodejs');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+
+// Middleware
+app.use(cors({
+  origin: process.env.FRONTEND_URL
+}));
+app.use(express.json());
 
 // Supabase client
 const supabase = createClient(
@@ -14,121 +17,12 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// Middleware CORS
-app.use(cors({
-  origin: process.env.FRONTEND_URL
-}));
-
-// ========================================
-// ⚠️ IMPORTANT : WEBHOOK AVANT express.json()
-// ========================================
-app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  let event;
-
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (err) {
-    console.log(`❌ Webhook Error: ${err.message}`);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  console.log('✅ Webhook reçu:', event.type);
-
-  // Paiement réussi
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-
-    console.log('💰 Paiement réussi:', session.id);
-
-    // Enregistrer dans Supabase
-    try {
-      const { data, error } = await supabase
-        .from('donations')
-        .insert({
-          name: session.metadata.name || null,
-          email: session.customer_details.email,
-          amount: session.amount_total / 100,
-          is_anonymous: session.metadata.isAnonymous === 'true',
-          accept_newsletter: session.metadata.acceptNewsletter === 'true',
-          stripe_payment_id: session.payment_intent,
-          stripe_session_id: session.id,
-          status: 'succeeded'
-        });
-
-      if (error) {
-        console.error('❌ Erreur Supabase:', error);
-      } else {
-        console.log('✅ Don enregistré dans Supabase');
-      }
-    } catch (dbError) {
-      console.error('❌ Erreur DB:', dbError);
-    }
-
-    // Envoyer email de confirmation avec EmailJS
-    
-  }
-
-  res.json({ received: true });
-});
-
-// ========================================
-// ⚠️ MAINTENANT ON PEUT METTRE express.json()
-// ========================================
-app.use(express.json());
-
-// ========================================
-// ROUTE PRINCIPALE : Créer une session Stripe Checkout
-// ========================================
-app.post('/api/create-checkout-session', async (req, res) => {
-  const { amount, email, name, isAnonymous, acceptNewsletter } = req.body;
-
-  try {
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price_data: {
-            currency: 'eur',
-            product_data: {
-              name: 'Don à SkyBlue',
-              description: 'Soutien aux orphelins',
-            },
-            unit_amount: Math.round(amount * 100),
-          },
-          quantity: 1,
-        },
-      ],
-      mode: 'payment',
-      success_url: `${process.env.FRONTEND_URL}/don-success`,
-      cancel_url: `${process.env.FRONTEND_URL}/faire-un-don`,
-      customer_email: email,
-      metadata: {
-        name: name || '',
-        isAnonymous: isAnonymous.toString(),
-        acceptNewsletter: acceptNewsletter.toString(),
-      },
-    });
-
-    res.json({ 
-      id: session.id,
-      url: session.url
-    });
-  } catch (error) {
-    console.error('Erreur création session:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
 // Route de test
 app.get('/', (req, res) => {
   res.json({ message: 'Backend SkyBlue opérationnel ✅' });
 });
-// Route de santé pour UptimeRobot
+
+// Route santé pour UptimeRobot
 app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'healthy',
@@ -138,15 +32,220 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Route de test (garde aussi celle-ci)
-app.get('/', (req, res) => {
-  res.json({ message: 'Backend SkyBlue opérationnel ✅' });
+// ============================================
+// BICTORYS PAYMENT INTEGRATION
+// ============================================
+
+// Créer un paiement Bictorys
+app.post('/api/create-bictorys-payment', async (req, res) => {
+  try {
+    const { amount, name, email, phone } = req.body;
+
+    console.log('📧 Création paiement Bictorys:', { amount, name, email, phone });
+
+    // Validation des données
+    if (!amount || !name || !email) {
+      return res.status(400).json({ error: 'Données manquantes' });
+    }
+
+    // Convertir EUR en XOF (1 EUR = 656 XOF)
+    const amountXOF = Math.round(amount * 656);
+
+    // Préparer les données pour Bictorys
+    const bictorysData = {
+      amount: amountXOF,
+      currency: 'XOF',
+      country: 'SN',
+      successRedirectUrl: `${process.env.FRONTEND_URL}/don-success?amount=${amount}&name=${encodeURIComponent(name)}&email=${encodeURIComponent(email)}`,
+      errorRedirectUrl: `${process.env.FRONTEND_URL}/faire-un-don?error=payment_failed`,
+      customer: {
+        name: name,
+        email: email,
+        phone: phone || '+221000000000', // Téléphone par défaut si non fourni
+        country: 'SN',
+        locale: 'fr-FR'
+      },
+      merchantReference: `DON-${Date.now()}`, // Référence unique
+      paymentReference: `SKYBLUE-${Date.now()}`
+    };
+
+    console.log('📤 Envoi à Bictorys:', bictorysData);
+
+    // Appel API Bictorys (Mode CHECKOUT)
+    const bictorysResponse = await fetch('https://api.test.bictorys.com/pay/v1/charges', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Api-Key': process.env.BICTORYS_PUBLIC_KEY
+      },
+      body: JSON.stringify(bictorysData)
+    });
+
+    const responseText = await bictorysResponse.text();
+    console.log('📥 Réponse Bictorys (brute):', responseText);
+
+    let bictorysResult;
+    try {
+      bictorysResult = JSON.parse(responseText);
+    } catch (parseError) {
+      console.error('❌ Erreur parsing JSON:', parseError);
+      return res.status(500).json({ 
+        error: 'Erreur serveur Bictorys', 
+        details: responseText 
+      });
+    }
+
+    if (!bictorysResponse.ok) {
+      console.error('❌ Erreur Bictorys:', bictorysResult);
+      return res.status(bictorysResponse.status).json({ 
+        error: 'Erreur création paiement',
+        details: bictorysResult
+      });
+    }
+
+    console.log('✅ Paiement Bictorys créé:', bictorysResult);
+
+    // Retourner l'URL de paiement (checkoutUrl ou paymentUrl selon la réponse Bictorys)
+    const checkoutUrl = bictorysResult.checkoutUrl || bictorysResult.paymentUrl || bictorysResult.url;
+
+    if (!checkoutUrl) {
+      console.error('❌ Pas d\'URL de checkout dans la réponse:', bictorysResult);
+      return res.status(500).json({ 
+        error: 'URL de paiement manquante',
+        details: bictorysResult
+      });
+    }
+
+    res.json({ 
+      checkoutUrl: checkoutUrl,
+      transactionId: bictorysResult.transactionId || bictorysResult.id,
+      amountXOF: amountXOF
+    });
+
+  } catch (error) {
+    console.error('❌ Erreur serveur:', error);
+    res.status(500).json({ 
+      error: 'Erreur serveur', 
+      message: error.message 
+    });
+  }
+});
+
+// ============================================
+// WEBHOOK BICTORYS
+// ============================================
+// ============================================
+// WEBHOOK BICTORYS
+// ============================================
+
+app.post('/webhook/bictorys', async (req, res) => {
+  console.log('🔔 Webhook Bictorys reçu');
+  console.log('Headers:', req.headers);
+  console.log('Body:', req.body);
+
+  try {
+    // Vérifier la clé secrète du webhook
+    const webhookSecret = req.headers['x-webhook-secret'] || req.headers['x-bictorys-secret'] || req.body.secret;
+    const expectedSecret = process.env.BICTORYS_WEBHOOK_SECRET || '1';
+
+    if (webhookSecret !== expectedSecret) {
+      console.error('❌ Clé secrète invalide:', webhookSecret);
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    console.log('✅ Clé secrète valide');
+
+    const event = req.body;
+
+    // Gérer les différents types d'événements Bictorys
+    if (event.status === 'SUCCESS' || event.status === 'COMPLETED' || event.eventType === 'payment.success') {
+      console.log('✅ Paiement réussi !');
+
+      // Extraire les données du paiement
+      const amount = event.amount || event.data?.amount;
+      const amountXOF = amount;
+      const amountEUR = Math.round((amountXOF / 656) * 100) / 100; // Reconvertir en EUR
+
+      const donorEmail = event.customer?.email || event.data?.customer?.email;
+      const donorName = event.customer?.name || event.data?.customer?.name;
+      const transactionId = event.transactionId || event.id || event.data?.id;
+      const paymentReference = event.paymentReference || event.merchantReference;
+
+      // Enregistrer le don dans Supabase
+      const { data, error } = await supabase
+        .from('donations')
+        .insert([
+          {
+            amount: amountEUR,
+            donor_name: donorName || 'Donateur anonyme',
+            donor_email: donorEmail,
+            payment_method: 'bictorys',
+            status: 'completed',
+            stripe_session_id: transactionId, // On utilise ce champ pour l'ID Bictorys
+            message: `Don via Bictorys - ${amountXOF} XOF`,
+            created_at: new Date().toISOString()
+          }
+        ]);
+
+      if (error) {
+        console.error('❌ Erreur Supabase:', error);
+        return res.status(500).json({ error: 'Erreur base de données' });
+      }
+
+      console.log('✅ Don enregistré dans Supabase:', data);
+
+      // Note: L'email sera envoyé par le frontend (comme avec Stripe)
+      
+      res.json({ received: true, status: 'success' });
+    } else if (event.status === 'FAILED' || event.status === 'CANCELLED' || event.eventType === 'payment.failed') {
+      console.log('❌ Paiement échoué ou annulé');
+      res.json({ received: true, status: 'failed' });
+    } else {
+      console.log('ℹ️ Événement non géré:', event.status || event.eventType);
+      res.json({ received: true, status: 'ignored' });
+    }
+
+  } catch (error) {
+    console.error('❌ Erreur webhook:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ============================================
+// AUTRES ROUTES (Contact, etc.)
+// ============================================
+
+// Route pour les messages de contact
+app.post('/api/contact', async (req, res) => {
+  try {
+    const { name, email, subject, message } = req.body;
+
+    const { data, error } = await supabase
+      .from('messages')
+      .insert([
+        {
+          name,
+          email,
+          subject,
+          message,
+          status: 'unread',
+          created_at: new Date().toISOString()
+        }
+      ]);
+
+    if (error) throw error;
+
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('❌ Erreur contact:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
 });
 
 // Démarrer le serveur
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Serveur démarré sur le port ${PORT}`);
   console.log(`📍 Frontend autorisé: ${process.env.FRONTEND_URL}`);
-  console.log(`💳 Stripe configuré en mode TEST`);
-  console.log(`📧 EmailJS configuré`);
+  console.log(`💳 Bictorys configuré en mode TEST`);
 });
